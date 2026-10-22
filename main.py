@@ -7,6 +7,8 @@
   python3 main.py post                # 立即发布今天的一歌
   python3 main.py post --dry-run      # 干跑(不发布)
   python3 main.py verify              # 回读最近动态
+  python3 main.py reply               # 立即扫一轮评论并回复
+  python3 main.py reply --dry-run     # 干跑评论回复
   python3 main.py scheduler           # 前台跑调度(一般用 run_daemon.py)
 """
 import argparse
@@ -56,6 +58,12 @@ def cmd_verify():
               f"{song.get('name', '')} - {arts}")
 
 
+def cmd_reply(dry_run=False):
+    import comment_reply
+    r = comment_reply.check_and_reply(dry_run=dry_run)
+    print(json.dumps(r, ensure_ascii=False, indent=1)[:400])
+
+
 def cmd_scheduler():
     import scheduler
     scheduler.main()
@@ -68,11 +76,14 @@ def main():
     p_post = sub.add_parser("post", help="立即发布")
     p_post.add_argument("--dry-run", action="store_true")
     sub.add_parser("verify", help="回读最近动态")
+    p_reply = sub.add_parser("reply", help="扫描评论并自动回复")
+    p_reply.add_argument("--dry-run", action="store_true")
     sub.add_parser("scheduler", help="前台运行调度器")
     args = parser.parse_args()
     {"status": cmd_status,
      "post": lambda: cmd_post(args.dry_run),
      "verify": cmd_verify,
+     "reply": lambda: cmd_reply(args.dry_run),
      "scheduler": cmd_scheduler}.get(args.cmd, lambda: parser.print_help())()
 
 

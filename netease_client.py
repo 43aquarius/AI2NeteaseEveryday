@@ -13,6 +13,7 @@ import hmac
 import json
 import random
 import time
+import os
 import urllib.parse
 from typing import Optional
 
@@ -472,6 +473,108 @@ class NeteaseClient:
         if body.get("code") != 200:
             raise RuntimeError(f"发文字动态失败: {body}")
         return body
+
+    # ---------- 歌单(2026-10-23 新增: 自动化创建歌单) ----------
+    def create_playlist(self, name: str, privacy: int = 0) -> int:
+        """创建歌单, 返回歌单id
+        privacy: 0=公开, 10=隐私(仅自己可见)"""
+        body = self._post_weapi(
+            "https://music.163.com/weapi/playlist/create",
+            {"name": name, "privacy": privacy,
+             "csrf_token": self._csrf()})
+        if body.get("code") != 200 or not (body.get("id") or body.get("playlist_id")):
+            raise RuntimeError(f"创建歌单失败: {body}")
+        return int(body.get("id") or body.get("playlist_id"))
+
+    def update_playlist_cover(self, pid: int, img_path: str) -> dict:
+        """更新歌单封面: NOS上传 → cover/update
+        参数名是 coverImgId(非imgId, imgSize/imgX/imgY是裁剪接口的,
+        本端点不传) — 2026-10-23 探针验证"""
+        import hashlib as _h
+        with open(img_path, "rb") as f:
+            data = f.read()
+        fname = os.path.basename(img_path)
+        md5 = _h.md5(data).hexdigest()
+        tk = self.nos_token_alloc(fname, len(data), md5,
+                                  ext="jpg" if fname.endswith(("jpg", "jpeg")) else "png")
+        self.nos_upload(tk["bucket"], tk["objectKey"], tk["token"], data)
+        body = self._post_weapi(
+            "https://music.163.com/weapi/playlist/cover/update",
+            {"id": int(pid), "coverImgId": tk["docId"],
+             "csrf_token": self._csrf()})
+        if body.get("code") != 200:
+            raise RuntimeError(f"封面更新失败: {body}")
+        return body
+
+    def update_playlist_desc(self, pid: int, desc: str) -> dict:
+        """更新歌单简介(参数名是desc非description, 2026-10-23 探针验证)"""
+        body = self._post_weapi(
+            "https://music.163.com/weapi/playlist/desc/update",
+            {"id": int(pid), "desc": desc,
+             "csrf_token": self._csrf()})
+        if body.get("code") != 200:
+            raise RuntimeError(f"简介更新失败: {body}")
+        return body
+
+    def update_playlist_tags(self, pid: int, tags: list) -> dict:
+        """更新歌单标签(影响推荐曝光, 最多10个; eapi通道实测可用)"""
+        body = self._eapi_android(
+            "/api/playlist/tags/update",
+            {"id": int(pid), "tags": ",".join(tags[:10])})
+        if body.get("code") != 200:
+            raise RuntimeError(f"标签更新失败: {body}")
+        return body
+
+    def add_playlist_tracks(self, pid: int, track_ids: list) -> dict:
+        """歌单添加歌曲(eapi通道, weapi有-462风控, 2026-10-23 实测)"""
+        if not track_ids:
+            return {"code": 200, "empty": True}
+        body = self._eapi_android(
+            "/api/playlist/manipulate/tracks",
+            {"op": "add", "pid": int(pid),
+             "trackIds": json.dumps([int(t) for t in track_ids]),
+             "imme": "true"})
+        if body.get("code") != 200:
+            # 502=歌曲已存在, 视为可接受
+            if body.get("code") == 502:
+                return {"code": 200, "dup": True}
+            raise RuntimeError(f"添加歌曲失败: {body}")
+        return body
+
+    def delete_playlist(self, pid: int) -> dict:
+        """删除歌单(eapi, 参数名pid, 2026-10-23 实测)"""
+        body = self._eapi_android("/api/playlist/delete", {"pid": int(pid)})
+        if body.get("code") != 200:
+            raise RuntimeError(f"删除歌单失败: {body}")
+        return body
+
+    def user_playlists(self) -> list:
+        """本人歌单列表(回读验证用)"""
+        if not self.uid:
+            self.login_status()
+        body = self._get_api(
+            f"https://music.163.com/api/user/playlist/",
+            {"uid": self.uid, "limit": 100, "offset": 0,
+             "includeVideo": "true"})
+        return body.get("playlist") or []
+
+    def search_songs(self, keyword: str, limit: int = 30) -> list:
+        """搜索歌曲(明文api), 返回 songs 列表"""
+        body = self._get_api(
+            "https://music.163.com/api/search/get/",
+            {"s": keyword, "type": 1, "limit": limit, "offset": 0})
+        if body.get("code") != 200:
+            raise RuntimeError(f"搜索失败: {body.get('code')}")
+        return body.get("result", {}).get("songs") or []
+
+    def simi_songs(self, song_id: int, limit: int = 20) -> list:
+        """相似歌曲(基于单曲推荐, 明文api)"""
+        body = self._get_api(
+            "https://music.163.com/api/v1/discovery/simiSong",
+            {"songid": int(song_id), "limit": limit, "offset": 0})
+        if body.get("code") != 200:
+            raise RuntimeError(f"相似歌曲失败: {body.get('code')}")
+        return (body.get("songs") or [])[:limit]
 
     # ---------- 回读验证 ----------
     def user_events(self, pagesize: int = 5) -> list:

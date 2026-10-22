@@ -95,15 +95,48 @@ def load_state() -> dict:
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH, encoding="utf-8") as f:
-                return json.load(f)
+                d = json.load(f)
+            # 运行位有内容但镜像更丰富(重启丢历史场景) → 用镜像合并
+            mirror = _load_state_mirror()
+            if mirror and len(mirror.get("history") or []) > len(d.get("history") or []):
+                # 保留运行位上的较新时间戳字段, 取镜像的完整历史
+                merged = dict(mirror)
+                merged.update({k: v for k, v in d.items()
+                               if k in ("last_reply_scan_at", "retry_at")})
+                return merged
+            return d
         except Exception:
             pass
+    mirror = _load_state_mirror()
+    if mirror:
+        return mirror
     return {"history": []}
+
+
+def _load_state_mirror() -> dict:
+    """state 镜像(/home/z/.secrets, 沙箱重启免疫; 2026-10-23 新增,
+    起因: 重启丢 history 导致周歌单无素材)"""
+    try:
+        p = "/home/z/.secrets/netease_state.json"
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
 
 def save_state(st: dict):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=1)
+    # 镜像到项目外持久层(失败不阻断)
+    try:
+        os.makedirs("/home/z/.secrets", exist_ok=True)
+        with open("/home/z/.secrets/netease_state.json", "w",
+                  encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
 
 
 def today_bjt() -> str:

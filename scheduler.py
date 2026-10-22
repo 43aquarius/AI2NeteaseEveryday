@@ -28,6 +28,8 @@ import daily_post
 CHECK_INTERVAL = 300   # 5 分钟对表一次
 REPLY_INTERVAL = 7200  # 评论巡检间隔 2 小时
 REPLY_HOURS = (8, 23)  # 巡检时段 08:00~23:00
+PLAYLIST_WDAY = 6      # 周日(0=周一)
+PLAYLIST_AT = (19, 30) # 周歌单生成时点 19:30
 
 
 def posted_today_via_api(cfg: dict) -> bool:
@@ -65,6 +67,15 @@ def due_reply(now) -> bool:
     state = load_state()
     last = state.get("last_reply_scan_at") or 0
     return time.time() - last >= REPLY_INTERVAL
+
+
+def due_playlist(state: dict, now) -> bool:
+    """周歌单: 周日19:30后且本周未建(周号防重)"""
+    if now.weekday() != PLAYLIST_WDAY:
+        return False
+    if (now.hour, now.minute) < PLAYLIST_AT:
+        return False
+    return state.get("last_playlist_week") != now.strftime("%G-W%V")
 
 
 def tick():
@@ -107,6 +118,18 @@ def tick():
         try:
             import comment_reply
             comment_reply.check_and_reply()
+        except Exception:
+            traceback.print_exc()
+
+    # ---- 周歌单(2026-10-23 新增, 每周日 19:30) ----
+    if due_playlist(state, now):
+        state = load_state()
+        state["last_playlist_week"] = now.strftime("%G-W%V")
+        save_state(state)
+        print(f"[调度] {now:%F %T} 生成周歌单")
+        try:
+            import playlist_maker
+            playlist_maker.run()
         except Exception:
             traceback.print_exc()
 

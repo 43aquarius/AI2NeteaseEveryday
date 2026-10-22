@@ -1,0 +1,7 @@
+config.json
+state.json
+daemon.log
+daemon.pid
+__pycache__/
+output/
+*.pyc

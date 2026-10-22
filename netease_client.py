@@ -7,19 +7,59 @@
   - 发帖端点: /weapi/e/event(文字动态), /weapi/e/event/share/resource(分享歌曲)
 """
 import base64
+import gzip
 import hashlib
+import hmac
 import json
 import random
 import time
+import urllib.parse
 from typing import Optional
 
 import requests
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
 
 PRESET_KEY = b"0CoJUm6Qyw8W8jud"
 IV = b"0102030405060708"
 EAPI_KEY = b"e82ckenh8dichen8"
+
+# ---------- xeapi (2026-10 评论回复端点已升级 xeapi 加密) ----------
+# 参考 NeteaseCloudMusicApiEnhanced/util/crypto.js + module/register_xeapikey.js
+XEAPI_STATIC_KEY = bytes.fromhex(
+    "ab1d5a430f6bb04a3f01e81ddd72bd916d5ce591248ac128714806d7f8fb1b84")
+# 注意: Node createHmac(key为字符串) 用其 UTF-8 字节, 不做 base64 解码
+XEAPI_SIGN_KEY = (b"mUHCwVNWJbunMqAHf5MImuirT6plvs6VSFW62MGHstFQxhBGdEoIh"
+                  b"LItH3djc4+FB/OKty3+lL2rGeoFBpVe5g==")
+XEAPI_UA = ("NeteaseMusic/9.5.61.260802021928(9005061);Dalvik/2.1.0 "
+            "(Linux; U; Android 12; HBN-AL00 Build/cd737a2.0)")
+X25519_SPKI_PREFIX = bytes.fromhex("302a300506032b656e032100")
+
+
+def _aes_ecb(key: bytes, data: bytes) -> bytes:
+    return AES.new(key, AES.MODE_ECB).encrypt(pad(data, 16, style="pkcs7"))
+
+
+def _aes_ecb_dec(key: bytes, data: bytes) -> bytes:
+    return unpad(AES.new(key, AES.MODE_ECB).decrypt(data), 16)
+
+
+def _xeapi_sign(timestamp: str, nonce: str) -> str:
+    mac = hmac.new(XEAPI_SIGN_KEY, f"{timestamp}{nonce}".encode(),
+                   hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
+
+
+def _xeapi_mid_transform(ciphertext: bytes) -> bytes:
+    rnd = random.randbytes(16)
+    xored = bytes(b ^ rnd[i & 0x0F] for i, b in enumerate(ciphertext))
+    rot = (rnd[0] & 0x0F) % len(xored) if xored else 0
+    return rnd + xored[rot:] + xored[:rot]
+
+
+def _x25519_aes_key(shared: bytes, eph_pub_raw: bytes) -> bytes:
+    prk = hmac.new(b"\x00" * 32, shared, hashlib.sha256).digest()
+    return hmac.new(prk, eph_pub_raw + b"\x01", hashlib.sha256).digest()[:16]
 PUBKEY_E = 0x10001
 PUBKEY_N = int(
     "00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b7251"
@@ -179,12 +219,248 @@ class NeteaseClient:
         r.raise_for_status()
         return r.json()
 
-    def share_resource(self, rid, msg: str, rtype: str = "song") -> dict:
-        """分享资源到动态(歌曲卡片): rtype=song, rid=歌曲id, msg=文案"""
-        body = self._eapi_android("/api/share/friends/resource",
-                                  {"type": rtype, "msg": msg, "id": int(rid)})
+    # ---------- 图片上传(动态配图) 三步链路 ----------
+    # 2026-10-22 调研(GitHub: XiaoMengXinX/Music163Api-Go + chaunsin/netease-cloud-music 交叉验证):
+    #   1) eapi /api/nos/token/alloc 拿 NOS 上传凭证(bucket/objectKey/token)
+    #   2) PUT {nos_node}/{bucket}/{objectKey} 原始字节(非 multipart, x-nos-token 头)
+    #      nos_node 来自 http://wanproxy.127.net/lbs?version=1.0&bucketname=cloudmusic
+    #   3) eapi /api/upload/event/img/v1 用 docId 换多尺寸图片ID(originId/squareId/...)
+    # 发帖时 pics 参数 = JSON字符串 [{"originId":"..","squareId":"..",...}](服务端按ID生成URL)
+
+    def _lbs_nodes(self) -> list:
+        r = self.s.get("http://wanproxy.127.net/lbs",
+                       params={"version": "1.0", "bucketname": "cloudmenu"},
+                       timeout=self.timeout)
+        # 实测 bucketname 参数值不影响返回 cloudmusic 节点列表
+        r.raise_for_status()
+        body = r.json()
+        return body.get("upload") or []
+
+    def nos_token_alloc(self, filename: str, size: int, md5: str, ext: str = "jpg") -> dict:
+        body = self._eapi_android("/api/nos/token/alloc", {
+            "filename": filename, "local": "false", "nos_product": 0,
+            "fileSize": size, "md5": md5, "ext": ext, "type": "image",
+        })
+        if body.get("code") != 200:
+            raise RuntimeError(f"NOS凭证失败: {body}")
+        return body.get("result") or {}
+
+    def nos_upload(self, bucket: str, object_key: str, token: str, data: bytes,
+                   content_type: str = "image/jpeg") -> None:
+        nodes = self._lbs_nodes() or ["http://nosup-hz1.127.net"]
+        last_err = None
+        for node in nodes[:3]:
+            url = (f"{node}/{bucket}/{object_key}"
+                   f"?version=1.0&offset=0&complete=true")
+            r = self.s.put(url, data=data, headers={
+                "x-nos-token": token,
+                "Content-Type": content_type,
+            }, timeout=60)
+            if r.status_code == 200:
+                return
+            last_err = f"{r.status_code} {r.text[:120]}"
+        raise RuntimeError(f"NOS上传失败: {last_err}")
+
+    def upload_event_img(self, doc_id: str, fmt: str = "jpeg") -> dict:
+        """用 docId 换动态图片信息(多尺寸ID)"""
+        body = self._eapi_android("/api/upload/event/img/v1",
+                                  {"imgid": doc_id, "format": fmt})
+        if body.get("code") != 200:
+            raise RuntimeError(f"图片信息换取失败: {body}")
+        return body
+
+    def upload_image(self, data: bytes, filename: str = "daily_song.jpg") -> dict:
+        """完整上传链路: 返回 pics 数组元素(dict)"""
+        md5 = hashlib.md5(data).hexdigest()
+        tk = self.nos_token_alloc(filename, len(data), md5)
+        self.nos_upload(tk["bucket"], tk["objectKey"], tk["token"], data)
+        info = self.upload_event_img(tk["docId"])
+        pic = info.get("picInfo") or {}
+        if not pic.get("originIdStr"):
+            raise RuntimeError(f"上传链路异常: {info}")
+        entry = {
+            "originId": str(pic["originIdStr"]),
+            "squareId": str(pic.get("squareIdStr") or pic["originIdStr"]),
+            "rectangleId": str(pic.get("rectangleIdStr") or pic["originIdStr"]),
+            "format": info.get("picSubtype") or "jpeg",
+            "width": pic.get("width"),
+            "height": pic.get("height"),
+            "index": 0,
+        }
+        # 完整版字段(安卓客户端对齐, chaunsin 实现)
+        for k in ("pcSquareId", "pcRectangleId", "originJpgId"):
+            if pic.get(f"{k}Str"):
+                entry[k] = str(pic[f"{k}Str"])
+        print(f"  [上传] {filename} {len(data)}B → originId={entry['originId'][:18]}… "
+              f"{pic.get('width')}x{pic.get('height')}")
+        return entry
+
+    # ---------- 分享(支持配图) ----------
+    def share_resource(self, rid, msg: str, rtype: str = "song",
+                       pics: list = None) -> dict:
+        """分享资源到动态(歌曲卡片): rtype=song, rid=歌曲id, msg=文案
+        pics: upload_image() 返回的元素列表(配图)"""
+        data = {"type": rtype, "msg": msg, "id": int(rid)}
+        if pics:
+            data["pics"] = json.dumps(pics, ensure_ascii=False,
+                                      separators=(",", ":"))
+        body = self._eapi_android("/api/share/friends/resource", data)
         if body.get("code") != 200:
             raise RuntimeError(f"分享失败: {body.get('code')} {body.get('message')}")
+        return body
+
+    # ---------- xeapi (评论回复专用) ----------
+    def fetch_xeapi_pubkey(self, force: bool = False) -> dict:
+        """明文 /api/bsr/sk/get 获取 xeapi 公钥(HMAC签名验证), 结果缓存"""
+        cached = getattr(self, "_xeapi_pubkey", None)
+        if cached and not force:
+            return cached
+        nonce = "".join(str(random.randint(0, 9)) for _ in range(16))
+        timestamp = str(int(time.time() * 1000))
+        data = {
+            "appVersion": "9.5.61",
+            "currentKeyVersion": "",
+            "deviceId": self.DEVICE_ID,
+            "nonce": nonce, "os": "android", "requestType": "active",
+            "signature": _xeapi_sign(timestamp, nonce),
+            "t1": "", "t2": "", "timestamp": timestamp, "uid": "",
+        }
+        r = self.s.post("https://interface.music.163.com/api/bsr/sk/get",
+                        data=data, headers={"User-Agent": XEAPI_UA},
+                        timeout=self.timeout)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("code") != 200:
+            raise RuntimeError(f"xeapi公钥获取失败: {body}")
+        d = body.get("data") or {}
+        if not d.get("encryptedData"):
+            raise RuntimeError(f"xeapi公钥响应异常: {body}")
+        if d.get("signature") != _xeapi_sign(str(d.get("timestamp")), nonce):
+            raise RuntimeError("xeapi公钥签名校验失败")
+        pub = json.loads(_aes_ecb_dec(XEAPI_STATIC_KEY,
+                                      base64.b64decode(d["encryptedData"])))
+        if not pub.get("sk"):
+            raise RuntimeError(f"xeapi公钥缺sk: {pub}")
+        pub["deviceId"] = self.DEVICE_ID
+        self._xeapi_pubkey = pub
+        print(f"  [xeapi] 公钥获取成功 version={pub.get('version')} "
+              f"sk={str(pub.get('sk'))[:8]}…")
+        return pub
+
+    def _xeapi(self, uri: str, data: dict) -> dict:
+        """xeapi 加密请求(评论回复等新端点)
+        uri: /api/xxx 形式; 返回解密后的 JSON"""
+        pub = self.fetch_xeapi_pubkey()
+        # 1) 明文: JSON {content: urlencode(body)}
+        body_str = urllib.parse.urlencode(
+            {k: ("" if v is None else str(v)) for k, v in data.items()})
+        plaintext = json.dumps({"content": body_str},
+                               separators=(",", ":")).encode()
+        # 2) 双层AES + mid transform
+        inner = _aes_ecb(XEAPI_STATIC_KEY, plaintext)
+        mid = _xeapi_mid_transform(inner)
+        dynamic_key = random.randbytes(16)
+        c = _aes_ecb(dynamic_key, mid)
+        # 3) S: X25519 ECDH + AES-GCM 包装动态密钥
+        from cryptography.hazmat.primitives.asymmetric.x25519 import (
+            X25519PrivateKey, X25519PublicKey)
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat)
+        eph = X25519PrivateKey.generate()
+        eph_raw = eph.public_key().public_bytes(Encoding.Raw,
+                                                PublicFormat.Raw)
+        peer_raw = base64.b64decode(pub["publicKey"])
+        shared = eph.exchange(X25519PublicKey.from_public_bytes(peer_raw))
+        aes_key = _x25519_aes_key(shared, eph_raw)
+        iv = random.randbytes(12)
+        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv, mac_len=16)
+        s_pt = (f"{base64.b64encode(dynamic_key).decode()}|android|"
+                f"{pub.get('sk') or ''}").encode()
+        ct, tag = cipher.encrypt_and_digest(s_pt)
+        s = eph_raw + iv + ct + tag
+        # 4) R: 版本声明
+        r_field = _aes_ecb(XEAPI_STATIC_KEY,
+                           f"{pub.get('version') or ''}|".encode())
+        music_u = ""
+        for part in self.cookie.split(";"):
+            if part.strip().startswith("MUSIC_U="):
+                music_u = part.strip().split("=", 1)[1]
+        headers = {
+            "User-Agent": XEAPI_UA,
+            "X-Client-Enc-State": "ENCRYPTED",
+            "x-aeapi": "true",
+            "content-type": "application/x-www-form-urlencoded;charset=utf-8",
+            "x-deviceid": self.DEVICE_ID,
+            "x-os": "android", "x-osver": "16", "x-appver": "9.5.61",
+            "x-sdeviceid": self.DEVICE_ID,
+            "x-buildver": str(int(time.time())),
+            "Cookie": (f"deviceId={self.DEVICE_ID}; os=android; osver=16; "
+                       f"appver=9.5.61; MUSIC_U={music_u}"),
+        }
+        if music_u:
+            headers["x-music-u"] = music_u
+        form = {"C": base64.urlsafe_b64encode(c).decode(),
+                "S": base64.b64encode(s).decode(),
+                "R": base64.b64encode(r_field).decode()}
+        r = self.s.post(f"https://interface3.music.163.com/xeapi/{uri[5:]}",
+                        data=form, headers=headers, timeout=self.timeout)
+        r.raise_for_status()
+        raw = r.content
+        try:
+            dec = _aes_ecb_dec(EAPI_KEY, raw)
+        except Exception:
+            return json.loads(raw)
+        if dec[:2] == b"\x1f\x8b":
+            dec = gzip.decompress(dec)
+        return json.loads(dec)
+
+    def reply_comment(self, thread_id: str, comment_id, content: str) -> dict:
+        """回复评论(2026-10 实测: eapi/weapi 均404, 必须走 xeapi)"""
+        body = self._xeapi("/api/v1/resource/comments/reply", {
+            "threadId": thread_id,
+            "commentId": str(comment_id),
+            "content": content,
+            "forwardEvent": "0",
+        })
+        if body.get("code") != 200:
+            raise RuntimeError(f"回复失败: {body}")
+        return body
+
+    # ---------- 评论(读取/回复) ----------
+    # threadId 格式: A_EV_2_{event_id}_{uid} (动态), 歌曲评论 R_SO_4_{songId}
+    def read_comments(self, thread_id: str, limit: int = 20,
+                      before_time: int = -1) -> dict:
+        """读取资源评论(明文api即可, 2026-10-22 实测)"""
+        body = self._get_api(
+            f"https://music.163.com/api/v1/resource/comments/{thread_id}",
+            {"rid": thread_id, "limit": limit, "offset": 0,
+             "beforeTime": before_time})
+        if body.get("code") != 200:
+            raise RuntimeError(f"评论读取失败: {body.get('code')}")
+        return body
+
+    def add_comment(self, thread_id: str, content: str) -> dict:
+        """直接评论资源(测试用): eapi + android"""
+        body = self._eapi_android("/api/v1/resource/comments/add", {
+            "threadId": thread_id,
+            "content": content,
+            "commentId": "0",
+            "forwardEvent": "0",
+            "resourceType": "0",
+            "expressionPicId": "-1",
+            "bubbleId": "-1",
+        })
+        if body.get("code") != 200:
+            raise RuntimeError(f"评论失败: {body}")
+        return body
+
+    def del_event(self, ev_id) -> dict:
+        """删除动态(测试帖清理用): /api/event/delete (weapi, 参数名是 id)"""
+        body = self._post_weapi("https://music.163.com/weapi/event/delete",
+                                {"id": int(ev_id),
+                                 "csrf_token": self._csrf()})
+        if body.get("code") != 200:
+            raise RuntimeError(f"删动态失败: {body}")
         return body
 
     def send_text(self, msg: str) -> dict:
@@ -195,15 +471,6 @@ class NeteaseClient:
                                    "type": "text"})
         if body.get("code") != 200:
             raise RuntimeError(f"发文字动态失败: {body}")
-        return body
-
-    def del_event(self, ev_id) -> dict:
-        """删除动态(测试帖清理用): /api/event/delete (weapi, 参数名是 id)"""
-        body = self._post_weapi("https://music.163.com/weapi/event/delete",
-                                {"id": int(ev_id),
-                                 "csrf_token": self._csrf()})
-        if body.get("code") != 200:
-            raise RuntimeError(f"删动态失败: {body}")
         return body
 
     # ---------- 回读验证 ----------

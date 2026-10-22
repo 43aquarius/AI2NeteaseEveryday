@@ -1,0 +1,6 @@
+{
+  "cookie": "MUSIC_U=你的MUSIC_U; __csrf=你的csrf",
+  "post_time": {"hour": 8, "minute": 0},
+  "topic_tag": "每日一歌",
+  "llm": {"style": "warm", "min_len": 30, "max_len": 90}
+}

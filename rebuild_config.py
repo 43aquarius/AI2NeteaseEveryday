@@ -61,7 +61,10 @@ def main():
         "cookie": normalize_cookie(raw),
         "post_time": {"hour": 8, "minute": 0},
         "topic_tag": "每日一歌",
+        "post_mode": "note",  # note=图文配图 / song=歌曲卡片
         "llm": {"style": "warm", "min_len": 30, "max_len": 90},
+        "comment_reply": {"enabled": True, "max_per_run": 5,
+                          "scan_days": 7},
     }
 
     from config import write_config

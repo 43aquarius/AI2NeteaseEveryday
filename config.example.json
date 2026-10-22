@@ -1,6 +1,19 @@
 {
   "cookie": "MUSIC_U=你的MUSIC_U; __csrf=你的csrf",
-  "post_time": {"hour": 8, "minute": 0},
+  "post_time": {
+    "hour": 8,
+    "minute": 0
+  },
+  "post_mode": "note",
   "topic_tag": "每日一歌",
-  "llm": {"style": "warm", "min_len": 30, "max_len": 90}
+  "llm": {
+    "style": "warm",
+    "min_len": 30,
+    "max_len": 90
+  },
+  "comment_reply": {
+    "enabled": true,
+    "max_per_run": 5,
+    "scan_days": 7
+  }
 }

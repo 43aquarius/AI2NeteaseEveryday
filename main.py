@@ -64,6 +64,13 @@ def cmd_reply(dry_run=False):
     print(json.dumps(r, ensure_ascii=False, indent=1)[:400])
 
 
+def cmd_playlist(dry_run=False):
+    import playlist_maker
+    r = playlist_maker.run(dry_run=dry_run)
+    print(json.dumps({k: v for k, v in (r or {}).items()
+                      if k != "plan"}, ensure_ascii=False, indent=1))
+
+
 def cmd_scheduler():
     import scheduler
     scheduler.main()
@@ -78,12 +85,15 @@ def main():
     sub.add_parser("verify", help="回读最近动态")
     p_reply = sub.add_parser("reply", help="扫描评论并自动回复")
     p_reply.add_argument("--dry-run", action="store_true")
+    p_pl = sub.add_parser("playlist", help="立即生成本周歌单")
+    p_pl.add_argument("--dry-run", action="store_true")
     sub.add_parser("scheduler", help="前台运行调度器")
     args = parser.parse_args()
     {"status": cmd_status,
      "post": lambda: cmd_post(args.dry_run),
      "verify": cmd_verify,
      "reply": lambda: cmd_reply(args.dry_run),
+     "playlist": lambda: cmd_playlist(args.dry_run),
      "scheduler": cmd_scheduler}.get(args.cmd, lambda: parser.print_help())()
 
 

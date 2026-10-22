@@ -21,7 +21,9 @@
   日推不可用时自动降级为热歌榜。
 - **文案**：LLM 生成 30~90 字走心短文案，纯文本输出（无 JSON 解析风险），
   自动清洗 emoji/引号包裹/多余前后缀；3 次失败降级固定模板。
-- **防重**：`state.json` 记录 `last_post_date`，同日不重发；发布后回读动态验证落地。
+- **防重**：`state.json` 记录 `last_post_date`，同日不重发；发布后回读动态验证落地；
+  state 丢失（如运行环境重启）时发帖前先回读「我的动态」对账，当日已有
+  `#每日一歌#` 帖则补写标记，**不会双发**。
 
 ## 技术
 
@@ -31,9 +33,10 @@
 |---|---|
 | `netease_client.py` | 网易云 API 客户端：weapi/eapi 加密（AES+RSA+MD5 摘要）、账号/日推/榜单/歌曲详情、分享歌曲动态、文字动态、删除动态、动态回读 |
 | `daily_post.py` | 内容管线：选歌 → LLM 文案 → 发布 → 回读验证 |
-| `scheduler.py` / `run_daemon.py` | 每日 08:00 定时 + 双 fork 守护进程 + 失败重试 |
+| `scheduler.py` / `run_daemon.py` | 每日 08:00 定时 + 双 fork 守护进程 + 失败重试；凭据缺失时优雅等待不崩溃，cookie 一到自动接管 |
 | `main.py` | CLI（status / post / verify / scheduler） |
-| `config.py` | 配置与 state 管理（北京时间） |
+| `config.py` | 配置与 state 管理（北京时间）+ **凭据三层持久化** |
+| `rebuild_config.py` | cookie 一键重建（参数/交互/环境变量三种输入，写入三层并验证登录） |
 
 ### 关键接口笔记（2026-10 实测）
 
@@ -54,7 +57,8 @@
 
 ```bash
 pip install -r requirements.txt
-cp config.example.json config.json   # 填入你的 cookie
+python3 rebuild_config.py "MUSIC_U=...; __csrf=..."   # 首选: 一键三层写入
+# 或手动: cp config.example.json config.json 并填入 cookie
 python3 main.py status               # 验证登录态
 python3 main.py post --dry-run       # 干跑看效果
 python3 main.py post                 # 真实发布
@@ -63,6 +67,22 @@ python3 run_daemon.py                # 拉起每日调度守护进程
 
 获取 cookie：浏览器登录 music.163.com → F12 → Network 任意请求 → 复制完整
 Cookie（关键字段：`MUSIC_U`、`__csrf`）。
+
+## 凭据三层持久化（沙箱重启生存设计）
+
+运行环境（沙箱）会不定期重启，实测规律：**快照点之后新建/修改的文件会被
+清除**，而 `config.json` 在 `.gitignore` 中、从不进快照 → 单纯放在项目里
+必然丢失（2026-10-22 已实际发生）。因此凭据做三层存储，加载时逐层回退、
+缺失自动回写自愈（见 `config.py`）：
+
+| 层 | 路径 | 存活机制 |
+|---|---|---|
+| 1 运行位 | `{项目}/config.json` | 随时可用，重启可能丢 |
+| 2 项目外 | `/home/z/.secrets/netease_config.json` | 不属快照管辖，重启免疫 |
+| 3 快照追踪位 | `{项目}/secrets_backup.json` | base64 包装，随平台快照可靠存活 |
+
+⚠ 第 3 层含凭据（虽 base64 包装），**严禁推送 GitHub**——推送脚本永远使用
+显式文件清单，本文件不在任何清单中。
 
 ## 配置
 
@@ -80,4 +100,5 @@ Cookie（关键字段：`MUSIC_U`、`__csrf`）。
 ## 声明
 
 - 仅供个人学习与自动化记录，请遵守网易云音乐服务条款，控制发布频率。
-- `config.json` / `state.json` 已在 `.gitignore` 中，**cookie 永不入库**。
+- `config.json` / `state.json` / `secrets_backup.json` 均不推送 GitHub，
+  **cookie 永不入公开仓库**。

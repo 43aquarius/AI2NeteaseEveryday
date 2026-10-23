@@ -1,120 +1,99 @@
-# AI2NeteaseEveryday
+# AI2NeteaseEveryday · 网易云音乐每日一歌机器人
 
-网易云音乐「每日一歌」自动发布机器人。
+> **Agent 交接文档**（2026-10-23 版）· 读完本文即可全权接管本项目的发布、调度与运维。
 
-每天 08:00（北京时间）从**每日推荐歌曲**中挑一首，由 LLM 生成走心文案，渲染
-**专属卡片配图**发布图文动态，自动挂载**歌手乐迷团 + 热门话题**扩大曝光；
-08:00~23:00 每 2 小时巡检评论区，**自动回复乐迷评论**。
+## 0. 三十秒了解
 
-## 栏目形态
+每日 08:00 在网易云音乐发布「每日一歌」动态（note 模式：1080×1440 配图 + 歌曲挂载 + 话题 + 乐迷团同步），自动巡检评论区并回复他人评论，每周日 19:30 自动创建一期公开歌单。全链路由常驻调度器驱动。
 
-```
-[自定义卡片配图: 黑胶+专辑封面+歌名+文案]  (note 模式)
-或 [歌曲卡片: 歌名 - 歌手 / 专辑封面]     (song 模式, 可点击播放)
+- 网易云账号：`uid=12108131883`（昵称「纯音乐--请欣赏」）
+- 代码目录（沙箱内）：`/home/z/my-project/netease-music-poster/`
 
-夏夜的蝉鸣里，这首歌像一阵凉风拂过心间。
-那些说不出口的话，在钢琴声里找到了归宿。
+## 1. 栏目与节奏
 
-#每日一歌# #ヨルシカ# #今日份听歌打卡#
-```
+| 任务 | 时刻（北京时间） | 说明 | 防重 |
+|------|------|------|------|
+| 每日一歌 | 每日 08:00 | note 模式动态：AI 生成 1080×1440 配图 → NOS 上传 → 歌曲挂载 + `#每日一歌#` 等话题 + 乐迷团 `boardId=303859`「今日份听歌打卡」双挂载 | `state.json` 日期标记 |
+| 评论自动回复 | 08:00–23:00 每 2 小时 | 扫描当日帖评论区，**仅回复他人**（按 uid=12108131883 过滤自己，防误回复留底评论） | 按已回复 commentId |
+| 周歌单 | 每周日 19:30 | state 记录的本周听歌 + 相似歌 + 每日推荐 → LLM 策划（标题/简介/18~26 选曲/白名单标签/AI 封面）→ 创建公开歌单并填充 | `last_playlist_week` 周号 |
 
-- **发布模式**（`config.post_mode`）：
-  - `note`（默认）：图文笔记 + Playwright 渲染的 1080×1440 卡片配图
-    （网易云红黑胶风格：专辑封面 + 歌名歌手 + 文案 + 话题胶囊），失败自动降级；
-  - `song`：歌曲卡片动态（可点击播放，自动带专辑封面）。
-- **话题挂载**（`activityInfoList`，2026-10 实测验证）：
-  - 歌手乐迷团：自动匹配已加入乐迷团中本曲歌手的 `boardId`（type=3/subType=11）；
-  - 文本话题：`今日份听歌打卡` 等已验证话题（type=2/subType=0）；
-  - 正文格式铁律：文案与话题行之间**单个 `\n`**，话题行**末尾带空格**。
-- **选歌**：每日推荐按日期做种随机（同日可复现）；不可用降级热歌榜。
-- **评论回复**：他人评论 → LLM 生成 10~45 字走心回复 → xeapi 加密回复，
-  失败自动降级 `@昵称` 提及式评论；`replied_comments` 防重复，每轮限 5 条。
-
-## 技术
-
-纯 Python 实现，无 Node.js 依赖：
-
-| 模块 | 说明 |
-|---|---|
-| `netease_client.py` | weapi/eapi/**xeapi** 三协议加密、日推/榜单/歌曲详情、图文/歌曲发布、NOS 图片上传三步链路、评论读取/回复/删除、动态回读 |
-| `image_maker.py` | HTML+Playwright 卡片配图渲染（黑胶+封面+文案） |
-| `daily_post.py` | 内容管线：选歌 → LLM 文案 → 卡片渲染上传 → 发布+挂载 → 回读验证 |
-| `comment_reply.py` | 评论巡检：扫描近 7 天动态 → LLM 回复 → xeapi/降级发送 |
-| `scheduler.py` / `run_daemon.py` | 08:00 发帖 + 评论巡检(2h) 守护进程，凭据缺失优雅等待 |
-| `main.py` | CLI（status / post / verify / **reply** / scheduler） |
-| `config.py` | 三层凭据持久化（config.json → ~/.secrets → base64 快照位） |
-| `rebuild_config.py` | cookie 一键重建（参数/交互/环境变量） |
-
-### 关键接口笔记（2026-10 实测）
-
-- **图文发布**：`/eapi/note/share/friends/resource`，`pics` 为图片ID JSON串
-  （`upload_image()` 产物），`activityInfoList` 挂载乐迷团/话题；
-  ⚠ `uuid` 是幂等键，**每次必须新生成**，复用会返回旧帖 ID 造成"假成功"。
-- **歌曲分享**：`/eapi/share/friends/resource`（eapi + 伪装 android：
-  `os=android`/`appver=9.1.65`/Android UA）；**歌曲卡片模式不支持自定义配图**
-  （服务端剥离 pics）。
-- **图片上传三步**：`/eapi/nos/token/alloc` 拿凭证 → NOS `PUT` 原始字节
-  （节点来自 `wanproxy.127.net/lbs`）→ `/eapi/upload/event/img/v1` 换多尺寸 ID。
-- **评论回复已升级 xeapi**（2026-10 实测 eapi/weapi 全部 404）：
-  - 公钥：明文 `POST /api/bsr/sk/get`（HMAC-SHA256 签名，key 为签名字符串
-    本身的 UTF-8 字节，不做 base64 解码）；
-  - 请求：AES-ECB 双层 + mid 变换 + X25519 ECDH + AES-GCM 动态密钥，
-    POST `/xeapi/v1/resource/comments/reply`（C/S/R 三段密文）；
-  - 评论 add 仍可用 eapi；读取评论明文 `/api/v1/resource/comments/{threadId}`。
-- **乐迷团**：`/eapi/social/fansgroup/bff/user/groups/get` 列已加入乐迷团，
-  `detail/get?groupId=` 取 `boardId`；threadId 格式 `A_EV_2_{eventId}_{uid}`。
-
-## 快速开始
+## 2. 环境与安装
 
 ```bash
+cd /home/z/my-project/netease-music-poster
 pip install -r requirements.txt
-python3 rebuild_config.py "MUSIC_U=...; __csrf=..."   # 首选: 一键三层写入
-python3 main.py status               # 验证登录态
-python3 main.py post --dry-run       # 干跑看效果(含卡片渲染)
-python3 main.py post                 # 真实发布
-python3 main.py reply --dry-run      # 干跑评论回复
-python3 run_daemon.py                # 拉起守护进程(发帖+评论巡检)
+python3 main.py status        # 验证登录态与状态
+python3 main.py post --dry-run
 ```
 
-获取 cookie：浏览器登录 music.163.com → F12 → Network 任意请求 → 复制完整
-Cookie（关键字段：`MUSIC_U`、`__csrf`）。
+## 3. 凭据体系（三层持久化）
 
-⚠ 经验（2026-10-22）：短时间高频发帖+删帖测试会触发风控导致 cookie 失效
-（MUSIC_U 被服务端作废）。日常频率（1 帖/天 + 少量回复）安全。
-
-## 凭据三层持久化（沙箱重启生存设计）
-
-运行环境（沙箱）会不定期重启，实测规律：**快照点之后新建/修改的文件会被
-清除**，而 `config.json` 在 `.gitignore` 中、从不进快照 → 单纯放在项目里
-必然丢失（2026-10-22 已实际发生）。因此凭据做三层存储，加载时逐层回退、
-缺失自动回写自愈（见 `config.py`）：
-
-| 层 | 路径 | 存活机制 |
-|---|---|---|
-| 1 运行位 | `{项目}/config.json` | 随时可用，重启可能丢 |
-| 2 项目外 | `/home/z/.secrets/netease_config.json` | 不属快照管辖，重启免疫 |
-| 3 快照追踪位 | `{项目}/secrets_backup.json` | base64 包装，随平台快照可靠存活 |
-
-⚠ 第 3 层含凭据（虽 base64 包装），**严禁推送 GitHub**——推送脚本永远使用
-显式文件清单，本文件不在任何清单中。
-
-## 配置
-
-`config.json`：
-
-```json
-{
-  "cookie": "MUSIC_U=...; __csrf=...",
-  "post_time": {"hour": 8, "minute": 0},
-  "post_mode": "note",
-  "topic_tag": "每日一歌",
-  "llm": {"style": "warm", "min_len": 30, "max_len": 90},
-  "comment_reply": {"enabled": true, "max_per_run": 5, "scan_days": 7}
-}
+```
+config.json                            ← 运行时读取（.gitignore）
+/home/z/.secrets/netease_config.json   ← 项目外持久层
+/home/z/.secrets/netease_state.json    ← 防重状态项目外镜像
+secrets_backup.json                    ← 项目内兜底
 ```
 
-## 声明
+需要的外部凭据：网易云 Web cookie（核心是 `MUSIC_U`）。
+重建通道：`python3 rebuild_config.py --env`（从 `MUSIC_U_COOKIE` 环境变量重建三层凭据）。
+沙箱重启后统一跑 `python3 /home/z/my-project/scripts/boot_heal.py` 自愈。
 
-- 仅供个人学习与自动化记录，请遵守网易云音乐服务条款，控制发布频率。
-- `config.json` / `state.json` / `secrets_backup.json` 均不推送 GitHub，
-  **cookie 永不入公开仓库**。
+## 4. 完整发布流程（每日一歌）
+
+```
+选曲(听歌风格/历史去重) → 文案+配图(1080x1440, PIL/AI)
+  → NOS 图片上传(见 §7 排雷)
+  → weapi 发动态: note 模式 + songId 挂载 + 话题 + 乐迷团 boardId
+  → 回读 /api/event 验证(event id 落地)
+  → state.json 写日期标记
+```
+
+评论回复：`xeapi reply_comment`（实测 code=200），线程定位
+`A_EV_2_<eventId>_<uid>`，按 uid 过滤防误回复自己的留底测试评论。
+
+周歌单（`playlist_maker.py`）：
+热门歌单 TOP50 标题规律分析（「前缀标签」+`丨`+诗意句，平均 17 字）→
+LLM 策划 → AI 封面 + PIL「纯音乐」红印章 → `create/cover/desc/tags/tracks` → 回读验证。
+首期实录：pid=18513970111『夜色温柔』21 曲全流程通过。
+
+## 5. 调度器与自愈
+
+```bash
+python3 main.py scheduler   # 前台运行(调试)
+nohup python3 scheduler.py >/dev/null 2>&1 &   # 常驻
+```
+
+- 60s tick；凭据缺失时**优雅等待**（不崩溃，凭据恢复后自动接管）。
+- 沙箱重启后统一入口：`python3 /home/z/my-project/scripts/boot_heal.py`。
+- 长任务（如歌单生成含 AI 封面）用
+  `/home/z/my-project/scripts/detached_run.py` 启动（双 fork 脱离，Bash 工具会清理 nohup 子进程）。
+
+## 6. 网易云 API 逆向排雷记录（2026-10 实测）
+
+- **双通道**：普通操作走 weapi；`manipulates/tracks`、`delete` 等 weapi 会触发 `-462` 风控 → 走 **eapi android 通道**。
+- Cookie 里有两个 `__csrf` 时**取后者**。
+- 发动态：event 的 `pics` 在**顶层字段**，不在加密 json 内。
+- 歌单接口参数名坑：封面参数是 `coverImgId`（不是 imgSize 组合）；简介参数是 `desc`（不是 description）；删除用 `pid`。
+- 评论回复：`xeapi` 通道，`reply_comment` 实测 code=200。
+
+## 7. 常用命令速查
+
+```bash
+python3 main.py status                 # 登录态+防重状态
+python3 main.py post --dry-run         # 干跑今日帖
+python3 main.py verify                 # 回读最近动态
+python3 main.py reply --dry-run        # 干跑评论扫描
+python3 main.py playlist --dry-run     # 干跑周歌单
+python3 main.py scheduler              # 前台调度器
+python3 rebuild_config.py --env        # 从 MUSIC_U_COOKIE 重建凭据
+python3 /home/z/my-project/scripts/boot_heal.py   # 一键自愈
+```
+
+## 8. 接管 checklist
+
+1. `boot_heal.py` → 确认「凭据: 已自愈 | 调度器: 已拉起」
+2. `python3 main.py status` → 登录态 OK、看最近发帖日期
+3. `python3 main.py verify` → 回读最近动态确认今日帖已发（**勿重复发**）
+4. 读 `/home/z/my-project/worklog.md` 最新两节
+5. 每次发布/改动后在 worklog.md 追加记录

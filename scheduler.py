@@ -7,6 +7,8 @@
   - 发帖前对账: 回读"我的动态"API, 当日已有 #每日一歌# 帖则跳过
     (state.json 被环境重启清除的场景下防止重复发帖)
   - 失败 30 分钟后重试(state.retry_at)
+  - 周歌单对账(2026-10-24): state 丢失时回读自建歌单,
+    本周已有「..丨..」系列歌单则补防重标记, 防重复创建
 
 评论巡检(2026-10-22 新增, 用户需求"有人评论最好能够回复"):
   - 08:00~23:00 之间每 2 小时扫描一次评论区, 他人评论自动回复
@@ -19,7 +21,7 @@
 import json
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import (BJT, config_exists, load_config, load_state, now_bjt,
                     save_state, today_bjt)
@@ -78,6 +80,34 @@ def due_playlist(state: dict, now) -> bool:
     return state.get("last_playlist_week") != now.strftime("%G-W%V")
 
 
+def reconcile_playlist_week(cfg: dict, now) -> bool:
+    """周歌单对账(state丢失防重复创建, 2026-10-24 新增):
+    回读自建歌单, 本周(周一起)已有「..丨..」系列歌单 → 补写防重标记。
+    起因: 沙箱重启清 state 导致 last_playlist_week 丢失, 周日会重复建歌单。
+    仅在 due_playlist 为真时被调用, 每周最多几次 API 开销。"""
+    try:
+        from netease_client import NeteaseClient
+        c = NeteaseClient(cfg["cookie"])
+        st = c.login_status()
+        uid = st.get("uid")
+        monday = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        for p in (c.user_playlists() or []):
+            if (p.get("creator") or {}).get("userId") != uid:
+                continue
+            ct = p.get("createTime") or 0
+            if ct / 1000 >= monday.timestamp() and "丨" in (p.get("name") or ""):
+                state = load_state()
+                state["last_playlist_week"] = now.strftime("%G-W%V")
+                save_state(state)
+                print(f"[对账] {now:%F %T} 本周已有系列歌单 "
+                      f"{p.get('name')!r}, 补防重标记, 跳过创建")
+                return True
+    except Exception:
+        traceback.print_exc()
+    return False
+
+
 def tick():
     if not config_exists():
         print(f"[等待] {now_bjt():%F %T} 凭据未配置(三层均缺), "
@@ -123,15 +153,18 @@ def tick():
 
     # ---- 周歌单(2026-10-23 新增, 每周日 19:30) ----
     if due_playlist(state, now):
-        state = load_state()
-        state["last_playlist_week"] = now.strftime("%G-W%V")
-        save_state(state)
-        print(f"[调度] {now:%F %T} 生成周歌单")
-        try:
-            import playlist_maker
-            playlist_maker.run()
-        except Exception:
-            traceback.print_exc()
+        if reconcile_playlist_week(cfg, now):
+            pass  # 本周已有系列歌单(对账发现), 不重复创建
+        else:
+            state = load_state()
+            state["last_playlist_week"] = now.strftime("%G-W%V")
+            save_state(state)
+            print(f"[调度] {now:%F %T} 生成周歌单")
+            try:
+                import playlist_maker
+                playlist_maker.run()
+            except Exception:
+                traceback.print_exc()
 
 
 def main():

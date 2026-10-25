@@ -4,7 +4,7 @@
     "hour": 8,
     "minute": 0
   },
-  "post_mode": "note",
+  "post_mode": "song_card",
   "topic_tag": "每日一歌",
   "llm": {
     "style": "warm",
@@ -15,5 +15,6 @@
     "enabled": true,
     "max_per_run": 5,
     "scan_days": 7
-  }
+  },
+  "_post_mode_note": "song_card=歌曲卡片+配图(主模式,2026-10-25起); note=纯图文; song=纯歌曲卡片"
 }

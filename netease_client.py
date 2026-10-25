@@ -576,6 +576,17 @@ class NeteaseClient:
             raise RuntimeError(f"相似歌曲失败: {body.get('code')}")
         return (body.get("songs") or [])[:limit]
 
+    def artist_hot_songs(self, artist_id: int, limit: int = 50) -> list:
+        """歌手热门歌曲(2026-10-25 新增: 乐迷团歌手选歌池)
+        返回标准 song 结构(name/ar/al/id), 供 pick_song 消费"""
+        body = self._post_weapi(
+            f"https://music.163.com/weapi/v1/artist/top/song",
+            {"id": int(artist_id), "limit": limit, "offset": 0,
+             "total": True})
+        if body.get("code") != 200:
+            raise RuntimeError(f"歌手热门失败: {body.get('code')}")
+        return body.get("songs") or []
+
     # ---------- 回读验证 ----------
     def user_events(self, pagesize: int = 5) -> list:
         """本人最近动态(原声 api, 用于发布后回读验证)"""

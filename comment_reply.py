@@ -26,6 +26,8 @@ REPLY_SYSTEM_PROMPT = (
     "现在要回复乐迷在你动态下的评论。要求: 10~45字, 口语化, 像老朋友聊天, "
     "真诚具体不说套话, 可以适当可爱但不过分。感谢夸奖时带上点个人听歌感受, "
     "回答问题时不确定的信息不要编造。绝不使用 emoji。"
+    "如果合适, 自然地提到今天分享的那首歌(比如歌名或听它的感受), "
+    "但别生硬, 更不要每句都提。"
     "直接输出回复内容本身, 不要引号不要解释。"
 )
 
@@ -84,9 +86,19 @@ def gen_reply(comment: str, song_name: str) -> str:
 
 
 def recent_threads(c: NeteaseClient, days: int = 7) -> list:
-    """本人最近动态的 (threadId, 歌名) 列表"""
+    """本人最近动态的 (threadId, 歌名) 列表
+    2026-10-25 修复: note 模式历史帖的 event json 里没有 song 字段,
+    歌名全部丢失 → 从 state.history 按 event_id 反查补齐"""
     if not c.uid:
         c.login_status()
+    # event_id → 歌名 映射(state.history 反查)
+    hist_song = {}
+    try:
+        for rec in (load_state().get("history") or []):
+            if rec.get("event_id") and rec.get("song"):
+                hist_song[str(rec["event_id"])] = rec["song"]
+    except Exception:
+        pass
     events = c.user_events(pagesize=20)
     now_ms = time.time() * 1000
     out = []
@@ -97,7 +109,9 @@ def recent_threads(c: NeteaseClient, days: int = 7) -> list:
         if not tid:
             continue
         j = json.loads(ev.get("json") or "{}")
-        song_name = (j.get("song") or {}).get("name") or "每日一歌"
+        song_name = ((j.get("song") or {}).get("name")
+                     or hist_song.get(str(ev.get("id")))
+                     or "每日一歌")
         out.append({"thread_id": tid, "song": song_name,
                     "event_id": ev.get("id")})
     return out

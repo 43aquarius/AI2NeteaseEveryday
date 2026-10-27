@@ -14,6 +14,12 @@
   - 08:00~23:00 之间每 2 小时扫描一次评论区, 他人评论自动回复
   - state.replied_comments 防重复回复
 
+每日歌单(2026-10-27 改造, 用户指令"一天一歌单, 以后不能再漏"):
+  - 每天 20:00 生成一期(原为每周日19:30, 已升级)
+  - 三重防漏: ① state.last_playlist_date 当日标记(含 .secrets 镜像)
+    ② API 对账(user_playlists 当日已有创建即补标记)
+    ③ playlist_retry_at 失败30分钟冷却重试, 当天内持续补
+
 用法:
   python3 scheduler.py            # 前台运行(调试)
   python3 run_daemon.py           # 守护进程拉起(推荐, 沙箱内可常驻)
@@ -30,7 +36,8 @@ import daily_post
 CHECK_INTERVAL = 300   # 5 分钟对表一次
 REPLY_INTERVAL = 7200  # 评论巡检间隔 2 小时
 REPLY_HOURS = (8, 23)  # 巡检时段 08:00~23:00
-PLAYLIST_AT = (20, 30) # 日歌单生成时点 20:30(2026-10-25 用户需求"一天一个歌单")
+PLAYLIST_AT = (20, 0)  # 每日歌单生成时点 20:00(2026-10-27 改每日)
+PLAYLIST_RETRY = 1800  # 歌单失败后重试冷却(秒)
 
 
 def posted_today_via_api(cfg: dict) -> bool:
@@ -71,38 +78,32 @@ def due_reply(now) -> bool:
 
 
 def due_playlist(state: dict, now) -> bool:
-    """日歌单(2026-10-25 改造): 每日20:30后且今日未建
-    playlist_retry_at: 上次失败后的退避时间(未到不重试)"""
-    if state.get("playlist_retry_at") and time.time() < state["playlist_retry_at"]:
-        return False
+    """每日歌单: 20:00后且今日未建(日期防重, 2026-10-27 改每日)"""
     if (now.hour, now.minute) < PLAYLIST_AT:
         return False
     return state.get("last_playlist_date") != now.strftime("%Y-%m-%d")
 
 
 def reconcile_playlist_today(cfg: dict, now) -> bool:
-    """日歌单对账(state丢失防重复创建, 2026-10-25 改造):
-    回读自建歌单, 今日(BJT)已创建过系列歌单(标题含丨) → 补写防重标记。
-    起因: 沙箱重启清 state 导致 last_playlist_date 丢失会重复建歌单。
-    仅在 due_playlist 为真时被调用, 每天最多几次 API 开销。"""
+    """每日歌单对账(state丢失防重复创建, 2026-10-27 每日版):
+    回读自建歌单, 今天(createTime>=今日00:00)已有创建 → 补写防重标记。
+    起因: 沙箱周期性清 state 导致漏建/重复建, API 对账才是真相源。"""
     try:
         from netease_client import NeteaseClient
         c = NeteaseClient(cfg["cookie"])
         st = c.login_status()
         uid = st.get("uid")
-        day0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         for p in (c.user_playlists() or []):
             if (p.get("creator") or {}).get("userId") != uid:
                 continue
             ct = p.get("createTime") or 0
-            if ct / 1000 >= day0.timestamp() and "丨" in (p.get("name") or ""):
+            if ct / 1000 >= midnight.timestamp():
                 state = load_state()
                 state["last_playlist_date"] = now.strftime("%Y-%m-%d")
-                state.setdefault("playlists", []).append({
-                    "date": now.strftime("%Y-%m-%d"), "pid": p.get("id"),
-                    "title": p.get("name"), "reconciled": True})
+                state.pop("playlist_retry_at", None)
                 save_state(state)
-                print(f"[对账] {now:%F %T} 今日已有系列歌单 "
+                print(f"[对账] {now:%F %T} 今天已建过歌单 "
                       f"{p.get('name')!r}, 补防重标记, 跳过创建")
                 return True
     except Exception:
@@ -153,28 +154,29 @@ def tick():
         except Exception:
             traceback.print_exc()
 
-    # ---- 日歌单(2026-10-25 改造, 每日 20:30) ----
+    # ---- 每日歌单(2026-10-27 改造: 每天20:00, 三重防漏) ----
     if due_playlist(state, now):
         if reconcile_playlist_today(cfg, now):
-            pass  # 今日已有系列歌单(对账发现), 不重复创建
+            pass  # 今天已建(对账发现), 不重复创建
+        elif state.get("playlist_retry_at") and \
+                time.time() < state["playlist_retry_at"]:
+            pass  # 上次失败冷却中, 到点自动重试
         else:
-            state = load_state()
-            state["last_playlist_date"] = now.strftime("%Y-%m-%d")
-            state.pop("playlist_retry_at", None)
-            save_state(state)
-            print(f"[调度] {now:%F %T} 生成日歌单")
+            print(f"[调度] {now:%F %T} 生成每日歌单")
             try:
                 import playlist_maker
-                playlist_maker.run(mode="daily")
+                r = playlist_maker.run()
+                state = load_state()
+                state.pop("playlist_retry_at", None)
+                if not r.get("ok") and r.get("reason") == "no_today_song":
+                    # 今日歌还没发(发帖失败/延迟), 5分钟后再来看
+                    pass
+                save_state(state)
             except Exception:
                 traceback.print_exc()
-                # 失败退避: 解除当日占坑, 30分钟后重试
-                # (若实际已创建成功但对账前崩溃, reconcile 会发现并补标记)
                 state = load_state()
-                state.pop("last_playlist_date", None)
-                state["playlist_retry_at"] = time.time() + 1800
+                state["playlist_retry_at"] = time.time() + PLAYLIST_RETRY
                 save_state(state)
-                print("[调度] 日歌单失败, 30分钟后重试")
 
 
 def main():

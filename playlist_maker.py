@@ -12,8 +12,10 @@
 → 本模块: 每日歌单(当天每日一歌作种子+相似歌扩充到20+首), LLM 起名+简介,
   AI生成封面+右下角统一小红印章(账号辨识度), 一键创建。
 
-频率: 每天 20:00(北京时间) 一期("一天一歌单", 2026-10-27 用户指令),
-也可 python3 playlist_maker.py 手动触发。
+频率: 合并发布(2026-10-28 用户指令"歌和歌单一起发")——每日一歌发帖流程内
+以当日选歌为种子调用(daily_post [3/6], seed_song 参数), 失败由调度器
+gap-fill 兜底补建; 也可 python3 playlist_maker.py 手动触发(从 history
+取当日已发歌作种子)。
 state 防重: last_playlist_date(当日标记) + API 对账(user_playlists
 createTime 当日已有即跳过), 调度器层还有 playlist_retry_at 失败冷却。
 """
@@ -263,7 +265,10 @@ def fallback_plan(week_songs: List[Dict], pool: List[Dict]) -> dict:
     }
 
 
-def run(dry_run: bool = False, cover_only: bool = False) -> dict:
+def run(dry_run: bool = False, cover_only: bool = False,
+        seed_song: Optional[Dict] = None) -> dict:
+    """seed_song(合并发布): daily_post 传入当日选歌 {id,name,artist},
+    发帖前建歌单; 不传则从 state.history 取今日已发歌(gap-fill/手动)。"""
     from netease_client import NeteaseClient
 
     print("===== 网易云每日歌单生成 =====")
@@ -293,7 +298,12 @@ def run(dry_run: bool = False, cover_only: bool = False) -> dict:
     except Exception:
         pass
 
-    week_songs = collect_today_song(state)
+    if seed_song and seed_song.get("id"):
+        week_songs = [dict(seed_song)]
+        print(f"[种子] 合并发布模式: 直接使用发帖选歌 "
+              f"《{seed_song.get('name')}》(id={seed_song.get('id')})")
+    else:
+        week_songs = collect_today_song(state)
     if not week_songs:
         print("[跳过] 今天还没有每日一歌记录, 无法提炼主题")
         return {"ok": False, "reason": "no_today_song"}

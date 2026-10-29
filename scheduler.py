@@ -14,8 +14,9 @@
   - 08:00~23:00 之间每 2 小时扫描一次评论区, 他人评论自动回复
   - state.replied_comments 防重复回复
 
-每日歌单(2026-10-27 改造, 用户指令"一天一歌单, 以后不能再漏"):
-  - 每天 20:00 生成一期(原为每周日19:30, 已升级)
+每日歌单(2026-10-28 合并发布改造, 用户指令"每日一歌和歌单一起发, 不要分开"):
+  - 取消独立 20:00 档, 歌单在每日一歌发帖流程内一并生成(daily_post [3/6])
+  - gap-fill 兜底: 歌已发但歌单未建时, 08:30 起每轮对表持续补建
   - 三重防漏: ① state.last_playlist_date 当日标记(含 .secrets 镜像)
     ② API 对账(user_playlists 当日已有创建即补标记)
     ③ playlist_retry_at 失败30分钟冷却重试, 当天内持续补
@@ -36,7 +37,7 @@ import daily_post
 CHECK_INTERVAL = 300   # 5 分钟对表一次
 REPLY_INTERVAL = 7200  # 评论巡检间隔 2 小时
 REPLY_HOURS = (8, 23)  # 巡检时段 08:00~23:00
-PLAYLIST_AT = (20, 0)  # 每日歌单生成时点 20:00(2026-10-27 改每日)
+PLAYLIST_GAPFILL_AT = (8, 30)  # 歌单gap-fill起点: 歌已发但歌单未建, 08:30起持续补
 PLAYLIST_RETRY = 1800  # 歌单失败后重试冷却(秒)
 
 
@@ -78,10 +79,15 @@ def due_reply(now) -> bool:
 
 
 def due_playlist(state: dict, now) -> bool:
-    """每日歌单: 20:00后且今日未建(日期防重, 2026-10-27 改每日)"""
-    if (now.hour, now.minute) < PLAYLIST_AT:
+    """歌单gap-fill(2026-10-28 合并发布改造):
+    歌已发(last_post_date=今日) 且 歌单未建(last_playlist_date≠今日)
+    且 已过 08:30 → 持续补建, 直到当天建成为止"""
+    if (now.hour, now.minute) < PLAYLIST_GAPFILL_AT:
         return False
-    return state.get("last_playlist_date") != now.strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")
+    if state.get("last_playlist_date") == today:
+        return False
+    return state.get("last_post_date") == today
 
 
 def reconcile_playlist_today(cfg: dict, now) -> bool:
@@ -154,7 +160,7 @@ def tick():
         except Exception:
             traceback.print_exc()
 
-    # ---- 每日歌单(2026-10-27 改造: 每天20:00, 三重防漏) ----
+    # ---- 每日歌单gap-fill(2026-10-28 合并发布改造: 发帖流程内已建则此处静默, 未建则补) ----
     if due_playlist(state, now):
         if reconcile_playlist_today(cfg, now):
             pass  # 今天已建(对账发现), 不重复创建
@@ -162,15 +168,15 @@ def tick():
                 time.time() < state["playlist_retry_at"]:
             pass  # 上次失败冷却中, 到点自动重试
         else:
-            print(f"[调度] {now:%F %T} 生成每日歌单")
+            print(f"[调度] {now:%F %T} 歌单gap-fill补建(歌已发歌单未建)")
             try:
                 import playlist_maker
                 r = playlist_maker.run()
                 state = load_state()
                 state.pop("playlist_retry_at", None)
                 if not r.get("ok") and r.get("reason") == "no_today_song":
-                    # 今日歌还没发(发帖失败/延迟), 5分钟后再来看
-                    pass
+                    # 今日歌记录缺失(state被清且未回填), 30分钟后再看
+                    state["playlist_retry_at"] = time.time() + PLAYLIST_RETRY
                 save_state(state)
             except Exception:
                 traceback.print_exc()

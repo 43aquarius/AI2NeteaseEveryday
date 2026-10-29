@@ -333,17 +333,44 @@ def run(dry_run: bool = False, force: bool = False) -> dict:
         raise RuntimeError(f"cookie 失效: {st}")
     print(f"[账号] {st['nickname']} (uid={st['uid']})")
 
-    print("[1/5] 选歌")
+    print("[1/6] 选歌")
     fan_board_map(c, state)   # 先确保乐迷团缓存就绪(选歌依赖歌手池)
     song = pick_song(c, today.replace("-", ""), state)
 
-    print("[2/5] LLM 生成文案")
+    print("[2/6] LLM 生成文案")
     copy_ = gen_copy(song)
     tags = build_tags(song)
+
+    # ---- 合并发布(2026-10-28 用户指令"歌和歌单一起发"): 发帖前以当日选歌为种子建歌单 ----
+    print("[3/6] 生成同款歌单(合并发布)")
+    pl_info = None
+    try:
+        import playlist_maker
+        seed = {"id": song["id"], "name": song["name"],
+                "artist": "/".join(a.get("name", "") for a in song.get("ar") or []),
+                "from": "今日每日一歌"}
+        pl_info = playlist_maker.run(dry_run=dry_run, seed_song=seed)
+    except Exception as e:
+        print(f"  [歌单] 生成失败(不阻断发帖, 调度器gap-fill会补): {str(e)[:80]}")
+    if pl_info and pl_info.get("ok"):
+        pl_title = pl_info.get("title") or (pl_info.get("plan") or {}).get("title")
+        n_tr = pl_info.get("tracks")
+        if not (isinstance(n_tr, int) and n_tr > 0):
+            n_tr = len((pl_info.get("plan") or {}).get("track_ids") or [])
+        if pl_title:
+            mention = f"同款歌单《{pl_title}》也整理好了"
+            if n_tr:
+                mention += f"，{n_tr}首连播"
+            mention += "，主页可听。"
+            BUDGET = 140  # 正文(文案+mention)字数预算, 超长截文案保歌单信息
+            if len(copy_) + len(mention) > BUDGET:
+                copy_ = copy_[:BUDGET - len(mention) - 1].rstrip("，。,.;；、") + "。"
+            copy_ = copy_ + mention
+            print(f"  [歌单] ✓ 《{pl_title}》({n_tr or '?'}首) 已并入正文")
     msg = build_msg(copy_, tags)
     print("  [文案]", msg.replace("\n", " / "))
 
-    print("[3/5] 挂载信息(乐迷团+话题)")
+    print("[4/6] 挂载信息(乐迷团+话题)")
     acts = build_activity_info(c, song, state)
 
     mode = cfg.get("post_mode", "song_card")
@@ -353,11 +380,12 @@ def run(dry_run: bool = False, force: bool = False) -> dict:
     if dry_run:
         print("[dry-run] 未发布")
         return {"dry_run": True, "msg": msg, "song_id": song["id"],
-                "mode": mode, "acts": [a.get("name") for a in acts]}
+                "mode": mode, "acts": [a.get("name") for a in acts],
+                "playlist": pl_info}
 
     # 配图(note 与 song_card 模式都要)
     if mode in ("song_card", "note"):
-        print("[4/5] 渲染卡片配图并上传")
+        print("[5/6] 渲染卡片配图并上传")
         try:
             from image_maker import render_card
             img_path = render_card(song, copy_, tags)
@@ -371,9 +399,9 @@ def run(dry_run: bool = False, force: bool = False) -> dict:
             else:
                 mode = "song"   # song_card 没图退化为纯歌卡
     else:
-        print("[4/5] 跳过配图(纯歌曲卡片模式)")
+        print("[5/6] 跳过配图(纯歌曲卡片模式)")
 
-    print(f"[5/5] 发布(mode={mode})")
+    print(f"[6/6] 发布(mode={mode})")
     ev_id = None
     if mode == "song_card":
         try:
@@ -403,9 +431,13 @@ def run(dry_run: bool = False, force: bool = False) -> dict:
     time.sleep(2)
     ok, evidence = verify(c, song, copy_, ev_id)
     rec = {"date": today, "song_id": song["id"], "song": song["name"],
+           "artist": "/".join(a.get("name", "") for a in song.get("ar") or []),
            "msg": msg, "mode": mode, "event_id": ev_id,
            "verified": ok, "time": time_str,
            "acts": [a.get("name") for a in acts]}
+    if pl_info and pl_info.get("ok") and pl_info.get("pid"):
+        rec["playlist"] = {"pid": pl_info.get("pid"),
+                           "title": pl_info.get("title")}
     state["last_post_date"] = today
     state["last_post"] = rec
     state.setdefault("history", []).append(rec)

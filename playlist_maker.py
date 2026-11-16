@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""自动化创建歌单(2026-10-23 用户需求; 2026-10-27 改每日)
+"""自动化创建歌单(2026-10-23 用户需求)
 
 "歌单封面和标题你学习一下别人是怎么做的"
 → 调研了网易云热门纯音乐歌单 TOP50:
@@ -9,15 +9,10 @@
         『纯音乐』当雨滴敲响琴键(1215万) 〖唯美纯音〗不需要歌词,也可以打动你的心(6269万)
   封面共性: 叙事性场景插画(日系动画风), 低饱和莫兰迪色, 大量留白,
         不压大标题, 治愈/孤独/静谧氛围
-→ 本模块: 每日歌单(当天每日一歌作种子+相似歌扩充到20+首), LLM 起名+简介,
+→ 本模块: 周歌单(本周每日一歌7首+相似歌扩充到20+首), LLM 起名+简介,
   AI生成封面+右下角统一小红印章(账号辨识度), 一键创建。
 
-频率: 合并发布(2026-10-28 用户指令"歌和歌单一起发")——每日一歌发帖流程内
-以当日选歌为种子调用(daily_post [3/6], seed_song 参数), 失败由调度器
-gap-fill 兜底补建; 也可 python3 playlist_maker.py 手动触发(从 history
-取当日已发歌作种子)。
-state 防重: last_playlist_date(当日标记) + API 对账(user_playlists
-createTime 当日已有即跳过), 调度器层还有 playlist_retry_at 失败冷却。
+频率: 每周日 19:30(北京时间) 一期, 也可 main.py playlist 手动触发。
 """
 import json
 import os
@@ -37,11 +32,11 @@ PLAN_SYSTEM = """你是网易云音乐博主"纯音乐--请欣赏"的资深歌�
 - 总长 11~25 字, 物哀/治愈/唯美审美, 精致不矫情
 简介规律: 60~120字, 诗意场景描写开头 + 一句情绪落点, 口语化不说教。
 
-你将拿到今天分享的一首歌和一批气质相近的候选扩充曲目, 任务:
-1. 提炼今天的音乐情绪主题
-2. 按上述规律起一个歌单标题(每天不同, 避免与常见标题雷同)
-3. 写简介(结尾自然带一句"每天更新"的系列感, 不用emoji)
-4. 从候选池里挑选 18~26 首与主题气质一致的曲目(必须含今天分享的那首)
+你将拿到本周每天分享过的歌和一批候选扩充曲目, 任务:
+1. 从本周歌单里提炼本周的音乐情绪主题
+2. 按上述规律起一个歌单标题
+3. 写简介(结尾自然带一句"每周日更新"的系列感, 不用emoji)
+4. 从候选池里挑选 18~26 首与主题气质一致的曲目(必须含本周每日一歌的全部曲目)
 5. 选 3~5 个官方标签(只能从给定列表选)
 6. 用英文写一段封面插画的画面描述(1~2句): 一个有故事感的静谧瞬间场景,
    与主题呼应, 日系动画插画风, 低饱和莫兰迪色, 不要出现任何文字
@@ -91,7 +86,7 @@ def _parse_llm_json(raw: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def collect_week_songs(state: dict) -> List[Dict]:
-    """本周的每日一歌(从 state.history) — 兼容保留, 供手动周回顾用"""
+    """本周的每日一歌(从 state.history)"""
     today = now_bjt().date()
     monday = today - timedelta(days=today.weekday())
     out = []
@@ -108,21 +103,8 @@ def collect_week_songs(state: dict) -> List[Dict]:
     return [x for x in out if x.get("id")]
 
 
-def collect_today_song(state: dict) -> List[Dict]:
-    """今天的每日一歌(每日歌单的种子, 2026-10-27)"""
-    today = now_bjt().strftime("%Y-%m-%d")
-    for rec in reversed(state.get("history") or []):
-        if rec.get("date") == today and rec.get("song_id"):
-            return [{"id": rec.get("song_id"), "name": rec.get("song", ""),
-                     "artist": (rec.get("artist") or "").strip(),
-                     "from": "今日每日一歌"}]
-    return []
-
-
-def build_track_pool(c, week_songs: List[Dict], cap: int = 60,
-                     sim_limit: int = 6) -> List[Dict]:
-    """候选池: 种子歌 + 每首的相似歌 + 今日推荐, 去重截断
-    sim_limit: 每首种子的相似歌取多少(每日模式种子少, 调大)"""
+def build_track_pool(c, week_songs: List[Dict], cap: int = 60) -> List[Dict]:
+    """候选池: 本周歌 + 每首的相似歌 + 今日推荐, 去重截断"""
     pool, seen = [], set()
 
     def _push(sid, name, artist, src):
@@ -133,12 +115,12 @@ def build_track_pool(c, week_songs: List[Dict], cap: int = 60,
                          "artist": (artist or "").strip(), "from": src})
 
     for s in week_songs:
-        _push(s["id"], s["name"], s.get("artist"), s.get("from") or "种子歌")
+        _push(s["id"], s["name"], s.get("artist"), "本周每日一歌")
 
     # 相似歌扩充
     for s in week_songs[:7]:
         try:
-            for sim in (c.simi_songs(s["id"], limit=sim_limit) or []):
+            for sim in (c.simi_songs(s["id"], limit=6) or []):
                 artists = "/".join(a.get("name", "")
                                    for a in (sim.get("artists") or []))
                 _push(sim.get("id"), sim.get("name", ""), artists, "相似推荐")
@@ -221,7 +203,7 @@ def render_cover(scene_prompt: str, out_path: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def generate_plan(week_songs: List[Dict], pool: List[Dict]) -> Optional[dict]:
-    lines = ["今日分享的歌(必须收录):"]
+    lines = ["本周每日一歌(必须全部收录):"]
     for s in week_songs:
         lines.append(f"- {s['name']} - {s.get('artist') or '未知'} (id={s['id']})")
     lines.append("\n候选扩充曲目池(从中挑选气质一致的):")
@@ -247,7 +229,7 @@ def generate_plan(week_songs: List[Dict], pool: List[Dict]) -> Optional[dict]:
 
 
 def fallback_plan(week_songs: List[Dict], pool: List[Dict]) -> dict:
-    """LLM不可用时的保底方案(每日版)"""
+    """LLM不可用时的保底方案"""
     ids = [s["id"] for s in week_songs]
     for p in pool:
         if len(ids) >= 20:
@@ -256,8 +238,8 @@ def fallback_plan(week_songs: List[Dict], pool: List[Dict]) -> dict:
             ids.append(p["id"])
     today = now_bjt()
     return {
-        "title": f"『纯音乐』{today.month}月{today.day}日的安静循环",
-        "desc": "今天分享的那首歌, 和它气质相近的旋律。\n安静的时候点开, 让这些纯音乐替你说出说不出的话。每天更新一期。",
+        "title": f"『纯音乐』本周循环的诗意 {today.month}月第{today.isocalendar()[1] - (today.replace(day=1).isocalendar()[1]) + 1}辑",
+        "desc": "本周每天分享过的一首歌, 和它们气质相近的旋律。\n安静的时候点开, 让这些纯音乐替你说出说不出的话。每周日更新。",
         "tags": ["纯音乐", "轻音乐", "治愈"],
         "track_ids": ids[:24],
         "cover_scene": ("a quiet lakeside at dusk with a small wooden boat "
@@ -265,13 +247,10 @@ def fallback_plan(week_songs: List[Dict], pool: List[Dict]) -> dict:
     }
 
 
-def run(dry_run: bool = False, cover_only: bool = False,
-        seed_song: Optional[Dict] = None) -> dict:
-    """seed_song(合并发布): daily_post 传入当日选歌 {id,name,artist},
-    发帖前建歌单; 不传则从 state.history 取今日已发歌(gap-fill/手动)。"""
+def run(dry_run: bool = False, cover_only: bool = False) -> dict:
     from netease_client import NeteaseClient
 
-    print("===== 网易云每日歌单生成 =====")
+    print("===== 网易云周歌单生成 =====")
     cfg = load_config()
     state = load_state()
     c = NeteaseClient(cfg["cookie"])
@@ -280,37 +259,14 @@ def run(dry_run: bool = False, cover_only: bool = False,
         raise RuntimeError(f"cookie 失效: {st}")
     print(f"[账号] {st.get('nickname')} (uid={st.get('uid')})")
 
-    # API 对账: 今天已建过歌单则直接跳过(state 丢失防重复创建)
-    today = now_bjt()
-    try:
-        for p in (c.user_playlists() or []):
-            if (p.get("creator") or {}).get("userId") != st.get("uid"):
-                continue
-            ct = p.get("createTime") or 0
-            if ct / 1000 >= today.replace(hour=0, minute=0, second=0,
-                                           microsecond=0).timestamp():
-                print(f"[对账] 今天已建过歌单 {p.get('name')!r}, 跳过")
-                state = load_state()
-                state["last_playlist_date"] = today.strftime("%Y-%m-%d")
-                save_state(state)
-                return {"ok": True, "skipped": True, "pid": p.get("id"),
-                        "title": p.get("name")}
-    except Exception:
-        pass
-
-    if seed_song and seed_song.get("id"):
-        week_songs = [dict(seed_song)]
-        print(f"[种子] 合并发布模式: 直接使用发帖选歌 "
-              f"《{seed_song.get('name')}》(id={seed_song.get('id')})")
-    else:
-        week_songs = collect_today_song(state)
+    week_songs = collect_week_songs(state)
     if not week_songs:
-        print("[跳过] 今天还没有每日一歌记录, 无法提炼主题")
-        return {"ok": False, "reason": "no_today_song"}
-    print(f"[素材] 今日每日一歌: 《{week_songs[0]['name']}》")
+        print("[跳过] 本周还没有每日一歌记录, 无法提炼主题")
+        return {"ok": False, "reason": "no_week_songs"}
+    print(f"[素材] 本周每日一歌 {len(week_songs)} 首")
 
     print("[1/4] 扩充候选池(相似歌+每日推荐)...")
-    pool = build_track_pool(c, week_songs, sim_limit=15)
+    pool = build_track_pool(c, week_songs)
     print(f"   候选池 {len(pool)} 首")
 
     print("[2/4] LLM 策划(标题/简介/选曲/封面场景)...")
@@ -369,10 +325,9 @@ def run(dry_run: bool = False, cover_only: bool = False,
         "pid": pid, "title": plan["title"],
         "tracks": plan["track_ids"], "verified": bool(mine),
     })
-    state["last_playlist_date"] = now_bjt().strftime("%Y-%m-%d")
     state["last_playlist_week"] = now_bjt().strftime("%G-W%V")
     save_state(state)
-    print(f"[完成] 每日歌单 id={pid} · https://music.163.com/#/playlist?id={pid}")
+    print(f"[完成] 歌单 id={pid} · https://music.163.com/#/playlist?id={pid}")
     return {"ok": True, "pid": pid, "title": plan["title"],
             "tracks": n_tracks}
 

@@ -5,6 +5,3 @@ daemon.pid
 __pycache__/
 output/
 *.pyc
-
-secrets_backup.json
-config.json
